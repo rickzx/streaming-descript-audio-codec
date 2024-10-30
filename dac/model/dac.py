@@ -1,18 +1,16 @@
 import math
-from typing import List
-from typing import Union
+from typing import List, Union
 
+import cached_conv as cc
 import numpy as np
 import torch
 from audiotools import AudioSignal
 from audiotools.ml import BaseModel
+from dac.nn.layers import Snake1d, WNConv1d, WNConvTranspose1d
+from dac.nn.quantize import ResidualVectorQuantize
 from torch import nn
 
 from .base import CodecMixin
-from dac.nn.layers import Snake1d
-from dac.nn.layers import WNConv1d
-from dac.nn.layers import WNConvTranspose1d
-from dac.nn.quantize import ResidualVectorQuantize
 
 
 def init_weights(m):
@@ -22,17 +20,40 @@ def init_weights(m):
 
 
 class ResidualUnit(nn.Module):
-    def __init__(self, dim: int = 16, dilation: int = 1):
+    def __init__(self, dim: int = 16, dilation: int = 1, cum_delay=0):
         super().__init__()
-        pad = ((7 - 1) * dilation) // 2
-        self.block = nn.Sequential(
-            Snake1d(dim),
-            WNConv1d(dim, dim, kernel_size=7, dilation=dilation, padding=pad),
-            Snake1d(dim),
-            WNConv1d(dim, dim, kernel_size=1),
+        self.block = []
+        self.block.append(Snake1d(dim))
+        self.block.append(
+            WNConv1d(
+                dim,
+                dim,
+                kernel_size=7,
+                dilation=dilation,
+                padding=cc.get_padding(7, 1, dilation),
+                cumulative_delay=cum_delay,
+            )
         )
+        self.block.append(Snake1d(dim))
+        self.block.append(
+            WNConv1d(
+                dim, dim, kernel_size=1, cumulative_delay=self.block[-2].cumulative_delay
+            )
+        )
+        self.block = cc.CachedSequential(*self.block)
+        self.cumulative_delay = self.block.cumulative_delay
+        if cc.USE_BUFFER_CONV:
+            self.cc_block = cc.AlignBranches(
+                self.block,
+                nn.Identity(),
+                delays=[self.block.cumulative_delay, cum_delay],
+            )
+            self.cumulative_delay = self.cc_block.cumulative_delay
 
     def forward(self, x):
+        if cc.USE_BUFFER_CONV:
+            return sum(self.cc_block(x))
+
         y = self.block(x)
         pad = (x.shape[-1] - y.shape[-1]) // 2
         if pad > 0:
@@ -41,21 +62,34 @@ class ResidualUnit(nn.Module):
 
 
 class EncoderBlock(nn.Module):
-    def __init__(self, dim: int = 16, stride: int = 1):
+    def __init__(self, dim: int = 16, stride: int = 1, cum_delay=0):
         super().__init__()
-        self.block = nn.Sequential(
-            ResidualUnit(dim // 2, dilation=1),
-            ResidualUnit(dim // 2, dilation=3),
-            ResidualUnit(dim // 2, dilation=9),
-            Snake1d(dim // 2),
+
+        self.block = []
+        self.block.append(ResidualUnit(dim // 2, dilation=1, cum_delay=cum_delay))
+        self.block.append(
+            ResidualUnit(
+                dim // 2, dilation=3, cum_delay=self.block[-1].cumulative_delay
+            )
+        )
+        self.block.append(
+            ResidualUnit(
+                dim // 2, dilation=9, cum_delay=self.block[-1].cumulative_delay
+            )
+        )
+        self.block.append(Snake1d(dim // 2))
+        self.block.append(
             WNConv1d(
                 dim // 2,
                 dim,
                 kernel_size=2 * stride,
                 stride=stride,
-                padding=math.ceil(stride / 2),
+                padding=cc.get_padding(2 * stride, stride),
+                cumulative_delay=self.block[-2].cumulative_delay,
             ),
         )
+        self.block = cc.CachedSequential(*self.block)
+        self.cumulative_delay = self.block.cumulative_delay
 
     def forward(self, x):
         return self.block(x)
@@ -70,22 +104,23 @@ class Encoder(nn.Module):
     ):
         super().__init__()
         # Create first convolution
-        self.block = [WNConv1d(1, d_model, kernel_size=7, padding=3)]
+        self.block = [WNConv1d(1, d_model, kernel_size=7, padding=cc.get_padding(7))]
 
         # Create EncoderBlocks that double channels as they downsample by `stride`
         for stride in strides:
             d_model *= 2
-            self.block += [EncoderBlock(d_model, stride=stride)]
+            self.block += [EncoderBlock(d_model, stride=stride, cum_delay=self.block[-1].cumulative_delay)]
 
         # Create last convolution
         self.block += [
             Snake1d(d_model),
-            WNConv1d(d_model, d_latent, kernel_size=3, padding=1),
+            WNConv1d(d_model, d_latent, kernel_size=3, padding=cc.get_padding(3), cumulative_delay=self.block[-1].cumulative_delay),
         ]
 
         # Wrap black into nn.Sequential
-        self.block = nn.Sequential(*self.block)
+        self.block = cc.CachedSequential(*self.block)
         self.enc_dim = d_model
+        self.cumulative_delay = self.block.cumulative_delay
 
     def forward(self, x):
         return self.block(x)
@@ -94,14 +129,14 @@ class Encoder(nn.Module):
 class DecoderBlock(nn.Module):
     def __init__(self, input_dim: int = 16, output_dim: int = 8, stride: int = 1):
         super().__init__()
-        self.block = nn.Sequential(
+        self.block = cc.CachedSequential(
             Snake1d(input_dim),
             WNConvTranspose1d(
                 input_dim,
                 output_dim,
                 kernel_size=2 * stride,
                 stride=stride,
-                padding=math.ceil(stride / 2),
+                padding=cc.get_padding(2 * stride, stride),
             ),
             ResidualUnit(output_dim, dilation=1),
             ResidualUnit(output_dim, dilation=3),
@@ -123,7 +158,7 @@ class Decoder(nn.Module):
         super().__init__()
 
         # Add first conv layer
-        layers = [WNConv1d(input_channel, channels, kernel_size=7, padding=3)]
+        layers = [WNConv1d(input_channel, channels, kernel_size=7, padding=cc.get_padding(7))]
 
         # Add upsampling + MRF blocks
         for i, stride in enumerate(rates):
@@ -134,11 +169,11 @@ class Decoder(nn.Module):
         # Add final conv layer
         layers += [
             Snake1d(output_dim),
-            WNConv1d(output_dim, d_out, kernel_size=7, padding=3),
+            WNConv1d(output_dim, d_out, kernel_size=7, padding=cc.get_padding(7)),
             nn.Tanh(),
         ]
 
-        self.model = nn.Sequential(*layers)
+        self.model = cc.CachedSequential(*layers)
 
     def forward(self, x):
         return self.model(x)
@@ -173,6 +208,7 @@ class DAC(BaseModel, CodecMixin):
 
         self.hop_length = np.prod(encoder_rates)
         self.encoder = Encoder(encoder_dim, encoder_rates, latent_dim)
+        self.encoder_cumulative_delay = self.encoder.cumulative_delay
 
         self.n_codebooks = n_codebooks
         self.codebook_size = codebook_size
@@ -241,10 +277,11 @@ class DAC(BaseModel, CodecMixin):
                 Number of samples in input audio
         """
         z = self.encoder(audio_data)
-        z, codes, latents, commitment_loss, codebook_loss = self.quantizer(
-            z, n_quantizers
-        )
-        return z, codes, latents, commitment_loss, codebook_loss
+        # z, codes, latents, commitment_loss, codebook_loss = self.quantizer(
+        #     z, n_quantizers
+        # )
+        # return z, codes, latents, commitment_loss, codebook_loss
+        return z
 
     def decode(self, z: torch.Tensor):
         """Decode given latent codes and return audio data
@@ -321,10 +358,31 @@ class DAC(BaseModel, CodecMixin):
             "vq/codebook_loss": codebook_loss,
         }
 
+    @classmethod
+    def enable_streaming(cls, state: bool):
+        cc.use_cached_conv(state)
+
+    def load_state_dict(self, state_dict, strict = True, assign = False):
+        new_state_dict = {}
+
+        for k, v in state_dict.items():
+            modified_key = k
+            for key in ["weight_g", "weight_v", "bias"]:
+                if key in k:
+                    # Insert "conv" before the last element in the key path
+                    path = k.split(".")
+                    path.insert(-1, "conv")
+                    modified_key = ".".join(path)
+            new_state_dict[modified_key] = v
+
+        state_dict.update(new_state_dict)
+        return super().load_state_dict(state_dict, strict, assign)
+
 
 if __name__ == "__main__":
-    import numpy as np
     from functools import partial
+
+    import numpy as np
 
     model = DAC().to("cpu")
 

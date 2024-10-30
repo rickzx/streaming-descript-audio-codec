@@ -1,3 +1,4 @@
+import cached_conv as cc
 import numpy as np
 import torch
 import torch.nn as nn
@@ -6,12 +7,32 @@ from einops import rearrange
 from torch.nn.utils import weight_norm
 
 
-def WNConv1d(*args, **kwargs):
-    return weight_norm(nn.Conv1d(*args, **kwargs))
+class WNConv1d(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.conv = cc.Conv1d(*args, **kwargs)
+        self.wn = weight_norm(self.conv)
+
+    def forward(self, x):
+        return self.conv(x)
+
+    @property
+    def cumulative_delay(self):
+        return self.conv.cumulative_delay
 
 
-def WNConvTranspose1d(*args, **kwargs):
-    return weight_norm(nn.ConvTranspose1d(*args, **kwargs))
+class WNConvTranspose1d(nn.Module):
+    def __init__(self, *args, **kwargs):
+        super().__init__()
+        self.conv = cc.ConvTranspose1d(*args, **kwargs)
+        self.wn = weight_norm(self.conv)
+
+    def forward(self, x):
+        return self.conv(x)
+
+    @property
+    def cumulative_delay(self):
+        return self.conv.cumulative_delay
 
 
 # Scripting this brings model speed up 1.4x
@@ -30,4 +51,5 @@ class Snake1d(nn.Module):
         self.alpha = nn.Parameter(torch.ones(1, channels, 1))
 
     def forward(self, x):
-        return snake(x, self.alpha)
+        res = snake(x, self.alpha)
+        return res
