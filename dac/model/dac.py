@@ -127,21 +127,25 @@ class Encoder(nn.Module):
 
 
 class DecoderBlock(nn.Module):
-    def __init__(self, input_dim: int = 16, output_dim: int = 8, stride: int = 1):
+    def __init__(self, input_dim: int = 16, output_dim: int = 8, stride: int = 1, cum_delay=0):
         super().__init__()
-        self.block = cc.CachedSequential(
-            Snake1d(input_dim),
+        self.block = []
+        self.block.append(Snake1d(input_dim))
+        self.block.append(
             WNConvTranspose1d(
                 input_dim,
                 output_dim,
                 kernel_size=2 * stride,
                 stride=stride,
                 padding=cc.get_padding(2 * stride, stride),
-            ),
-            ResidualUnit(output_dim, dilation=1),
-            ResidualUnit(output_dim, dilation=3),
-            ResidualUnit(output_dim, dilation=9),
+                cumulative_delay=cum_delay,
+            )
         )
+        self.block.append(ResidualUnit(output_dim, dilation=1, cum_delay=self.block[-1].cumulative_delay))
+        self.block.append(ResidualUnit(output_dim, dilation=3, cum_delay=self.block[-1].cumulative_delay))
+        self.block.append(ResidualUnit(output_dim, dilation=9, cum_delay=self.block[-1].cumulative_delay))
+        self.block = cc.CachedSequential(*self.block)
+        self.cumulative_delay = self.block.cumulative_delay
 
     def forward(self, x):
         return self.block(x)
@@ -164,16 +168,17 @@ class Decoder(nn.Module):
         for i, stride in enumerate(rates):
             input_dim = channels // 2**i
             output_dim = channels // 2 ** (i + 1)
-            layers += [DecoderBlock(input_dim, output_dim, stride)]
+            layers += [DecoderBlock(input_dim, output_dim, stride, cum_delay=layers[-1].cumulative_delay)]
 
         # Add final conv layer
         layers += [
             Snake1d(output_dim),
-            WNConv1d(output_dim, d_out, kernel_size=7, padding=cc.get_padding(7)),
+            WNConv1d(output_dim, d_out, kernel_size=7, padding=cc.get_padding(7), cumulative_delay=layers[-1].cumulative_delay),
             nn.Tanh(),
         ]
 
         self.model = cc.CachedSequential(*layers)
+        self.cumulative_delay = self.model.cumulative_delay
 
     def forward(self, x):
         return self.model(x)
@@ -226,6 +231,7 @@ class DAC(BaseModel, CodecMixin):
             decoder_dim,
             decoder_rates,
         )
+        self.decorder_cumulative_delay = self.decoder.cumulative_delay
         self.sample_rate = sample_rate
         self.apply(init_weights)
 
